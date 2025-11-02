@@ -1,0 +1,1955 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import mean_squared_error, accuracy_score, r2_score, mean_absolute_error, classification_report
+from sklearn.impute import SimpleImputer
+import joblib
+import os
+from streamlit_option_menu import option_menu
+import google.generativeai as genai
+import warnings
+warnings.filterwarnings('ignore')
+
+# Configure Gemini API
+genai.configure(api_key="AIzaSyDJISXqyG8c8bczeGhVWwqEVGDnfndE8ZI")
+
+# Page configuration
+st.set_page_config(
+    page_title="Salary Prediction & Role Classification",
+    page_icon="💰",
+    initial_sidebar_state="expanded"
+)
+
+# Initialize session state with default values
+def init_session_state():
+    if 'df' not in st.session_state:
+        st.session_state.df = None
+    if 'model_salary' not in st.session_state:
+        st.session_state.model_salary = None
+    if 'model_role' not in st.session_state:
+        st.session_state.model_role = None
+    if 'label_encoders' not in st.session_state:
+        st.session_state.label_encoders = {}
+    if 'last_salary_prediction' not in st.session_state:
+        st.session_state.last_salary_prediction = None
+    if 'last_role_prediction' not in st.session_state:
+        st.session_state.last_role_prediction = None
+    if 'salary_input_data' not in st.session_state:
+        st.session_state.salary_input_data = {}
+    if 'role_input_data' not in st.session_state:
+        st.session_state.role_input_data = {}
+    if 'last_salary_ai_suggestion' not in st.session_state:
+        st.session_state.last_salary_ai_suggestion = None
+    if 'last_role_ai_suggestion' not in st.session_state:
+        st.session_state.last_role_ai_suggestion = None
+    if 'form_submitted' not in st.session_state:
+        st.session_state.form_submitted = False
+    
+    # Model training status
+    if 'models_trained' not in st.session_state:
+        st.session_state.models_trained = False
+    if 'last_training_time' not in st.session_state:
+        st.session_state.last_training_time = None
+    
+    # Initialize clustering parameters in session state if not exists
+    if 'clustering_params' not in st.session_state:
+        st.session_state.clustering_params = {
+            'selected_features': ['Salary', 'ExperienceYears', 'ProductivityScore'],
+            'n_clusters': 3,
+            'df_clustered': None,
+            'cluster_metrics': None,
+            'last_cluster_id': None,
+            'clustering_done': False,
+            'plot_type': '3D Scatter',
+            'color_theme': 'Plotly'
+        }
+    
+# Initialize session state
+init_session_state()
+
+# Data preprocessing for encoding and imputation
+def preprocess_data(df, for_training=False):
+    df_processed = df.copy()
+    if 'label_encoders' not in st.session_state:
+        st.session_state.label_encoders = {}
+    
+    # Impute missing values for all columns
+    numeric_cols = df_processed.select_dtypes(include=['number']).columns
+    if len(numeric_cols) > 0:
+        imputer_num = SimpleImputer(strategy='mean')
+        df_processed[numeric_cols] = imputer_num.fit_transform(df_processed[numeric_cols])
+    
+    categorical_cols = df_processed.select_dtypes(include=['object']).columns.tolist()
+    for col in categorical_cols:
+        df_processed[col] = df_processed[col].fillna('Unknown').astype(str)
+        if for_training or col not in st.session_state.label_encoders:
+            le = LabelEncoder()
+            df_processed[col] = le.fit_transform(df_processed[col])
+            st.session_state.label_encoders[col] = le
+        else:
+            le = st.session_state.label_encoders[col]
+            df_processed[col] = df_processed[col].map(lambda x: le.transform([x])[0] if x in le.classes_ else -1)
+    
+    return df_processed
+
+# Handle missing values (user-controlled)
+def impute_missing_values(df, num_strategy='mean', fill_value_num=None, cat_strategy='most_frequent', fill_value_cat='Unknown'):
+    df_imputed = df.copy()
+    numeric_cols = df_imputed.select_dtypes(include=['number']).columns
+    if len(numeric_cols) > 0:
+        imputer_num = SimpleImputer(strategy=num_strategy, fill_value=fill_value_num)
+        df_imputed[numeric_cols] = imputer_num.fit_transform(df_imputed[numeric_cols])
+    cat_cols = df_imputed.select_dtypes(include=['object', 'category']).columns
+    if len(cat_cols) > 0:
+        imputer_cat = SimpleImputer(strategy=cat_strategy, fill_value=fill_value_cat)
+        df_imputed[cat_cols] = imputer_cat.fit_transform(df_imputed[cat_cols])
+    return df_imputed
+
+# Train models
+@st.cache_data(show_spinner='Training models...')
+def train_models(df):
+    try:
+        required_columns = ['Age', 'Gender', 'Department', 'ExperienceYears', 'EducationLevel', 'PerformanceRating', 'LastPromotionYear', 'ProductivityScore', 'Salary', 'Designation', 'Skillset']
+        missing_cols = [col for col in required_columns if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns: {', '.join(missing_cols)}")
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        status_text.text("Preprocessing data...")
+        progress_bar.progress(10)
+        
+        df_processed = preprocess_data(df, for_training=True)
+        
+        # Create skill count feature (better than encoding entire skillset string)
+        # Handle null/missing values properly
+        def count_skills(skillset):
+            if pd.isna(skillset) or str(skillset).lower() in ['nan', 'none', '', 'unknown']:
+                return 0
+            skills = [s.strip() for s in str(skillset).split(',') if s.strip() and s.strip().lower() not in ['nan', 'none', '', 'unknown']]
+            return len(skills)
+        
+        df_processed['SkillCount'] = df['Skillset'].apply(count_skills)
+        
+        X_salary = df_processed[['Age', 'Gender', 'Department', 'ExperienceYears', 'EducationLevel', 'PerformanceRating', 'LastPromotionYear', 'ProductivityScore', 'SkillCount']]
+        y_salary = df_processed['Salary']
+        X_role = df_processed[['Salary', 'ExperienceYears', 'ProductivityScore', 'SkillCount']]
+        y_role = df_processed['Designation']
+        
+        status_text.text("Splitting data...")
+        progress_bar.progress(30)
+        X_train_s, X_test_s, y_train_s, y_test_s = train_test_split(X_salary, y_salary, test_size=0.2, random_state=42)
+        X_train_r, X_test_r, y_train_r, y_test_r = train_test_split(X_role, y_role, test_size=0.2, random_state=42)
+        
+        status_text.text("Training salary prediction model...")
+        progress_bar.progress(50)
+        model_salary = RandomForestRegressor(n_estimators=150, max_depth=10, min_samples_split=5, n_jobs=-1, random_state=42)
+        model_salary.fit(X_train_s, y_train_s)
+        
+        status_text.text("Training role classification model...")
+        progress_bar.progress(70)
+        model_role = RandomForestClassifier(n_estimators=100, max_depth=8, min_samples_split=5, n_jobs=-1, random_state=42, class_weight='balanced')
+        model_role.fit(X_train_r, y_train_r)
+        
+        st.session_state.model_salary = model_salary
+        st.session_state.model_role = model_role
+        
+        status_text.text("Calculating model performance...")
+        progress_bar.progress(90)
+        y_pred_salary = model_salary.predict(X_test_s)
+        salary_r2 = r2_score(y_test_s, y_pred_salary)
+        salary_rmse = np.sqrt(mean_squared_error(y_test_s, y_pred_salary))
+        salary_mae = mean_absolute_error(y_test_s, y_pred_salary)
+        
+        y_pred_role = model_role.predict(X_test_r)
+        role_accuracy = accuracy_score(y_test_r, y_pred_role)
+        
+        feature_importance = pd.DataFrame({
+            'Feature': X_salary.columns,
+            'Importance': model_salary.feature_importances_
+        }).sort_values('Importance', ascending=False)
+        
+        fig = px.bar(
+            feature_importance.head(10),
+            x='Importance', y='Feature', orientation='h',
+            title='Top 10 Important Features for Salary Prediction',
+            labels={'Importance': 'Importance Score', 'Feature': ''}
+        )
+        fig.update_layout(showlegend=False)
+        
+        progress_bar.progress(100)
+        status_text.text("Training completed successfully!")
+        
+        # Display training confirmation
+        st.success(f"✅ Model trained with {len(X_salary.columns)} features including SkillCount")
+        st.info(f"📊 Training data: {len(X_train_s)} samples | Test data: {len(X_test_s)} samples")
+        
+        return {
+            'salary_metrics': {
+                'r2': salary_r2,
+                'rmse': salary_rmse,
+                'mae': salary_mae,
+                'feature_importance': fig
+            },
+            'role_metrics': {
+                'accuracy': role_accuracy,
+                'classification_report': classification_report(y_test_r, y_pred_role, output_dict=True)
+            },
+            'feature_importance_data': feature_importance
+        }
+    except Exception as e:
+        st.error(f"❌ Error training models: {str(e)}")
+        return None
+    finally:
+        if 'progress_bar' in locals():
+            progress_bar.empty()
+        if 'status_text' in locals():
+            status_text.empty()
+
+# Predict salary
+def predict_salary(input_data, return_confidence=False):
+    try:
+        if 'model_salary' not in st.session_state or st.session_state.model_salary is None:
+            raise ValueError("Model not trained. Please train the model first.")
+        
+        input_df = pd.DataFrame([input_data])
+        input_processed = preprocess_data(input_df)
+        
+        # Create skill count feature (handle null/missing values)
+        skillset = input_data.get('Skillset', '')
+        if pd.isna(skillset) or str(skillset).lower() in ['nan', 'none', '', 'unknown']:
+            skill_count = 0
+        else:
+            skill_count = len([s.strip() for s in str(skillset).split(',') if s.strip() and s.strip().lower() not in ['nan', 'none', '', 'unknown']])
+        input_processed['SkillCount'] = skill_count
+        
+        required_features = ['Age', 'Gender', 'Department', 'ExperienceYears', 'EducationLevel', 'PerformanceRating', 'LastPromotionYear', 'ProductivityScore', 'SkillCount']
+        input_features = input_processed[required_features]
+        
+        prediction = st.session_state.model_salary.predict(input_features)[0]
+        
+        if return_confidence and hasattr(st.session_state.model_salary, 'estimators_'):
+            predictions = np.array([tree.predict(input_features)[0] for tree in st.session_state.model_salary.estimators_])
+            std = np.std(predictions)
+            confidence_interval = (max(0, prediction - 1.96 * std), prediction + 1.96 * std)
+            return prediction, confidence_interval
+        
+        return prediction
+    except Exception as e:
+        st.error(f"❌ Error making prediction: {str(e)}")
+        return None
+
+# Classify role
+def classify_role(input_data, return_probabilities=False):
+    try:
+        if 'model_role' not in st.session_state or st.session_state.model_role is None:
+            raise ValueError("Model not trained. Please train the model first.")
+        
+        required_features = ['Salary', 'ExperienceYears', 'ProductivityScore', 'Skillset']
+        missing_features = [f for f in required_features if f not in input_data]
+        if missing_features:
+            raise ValueError(f"Missing required features: {', '.join(missing_features)}")
+        
+        input_df = pd.DataFrame([input_data])
+        input_processed = preprocess_data(input_df)
+        
+        # Create skill count feature (handle null/missing values)
+        skillset = input_data.get('Skillset', '')
+        if pd.isna(skillset) or str(skillset).lower() in ['nan', 'none', '', 'unknown']:
+            skill_count = 0
+        else:
+            skill_count = len([s.strip() for s in str(skillset).split(',') if s.strip() and s.strip().lower() not in ['nan', 'none', '', 'unknown']])
+        input_processed['SkillCount'] = skill_count
+        
+        input_features = input_processed[['Salary', 'ExperienceYears', 'ProductivityScore', 'SkillCount']]
+        
+        model = st.session_state.model_role
+        predicted_class_idx = model.predict(input_features)[0]
+        
+        if 'Designation' in st.session_state.label_encoders:
+            le = st.session_state.label_encoders['Designation']
+            predicted_role = le.inverse_transform([predicted_class_idx])[0]
+            
+            if return_probabilities and hasattr(model, 'predict_proba'):
+                probabilities = model.predict_proba(input_features)[0]
+                role_probabilities = {le.inverse_transform([i])[0]: float(prob) for i, prob in enumerate(probabilities)}
+                return predicted_role, role_probabilities
+            
+            return predicted_role
+        
+        return predicted_class_idx
+    except Exception as e:
+        st.error(f"❌ Error classifying role: {str(e)}")
+        return None
+
+# Visualization functions
+def plot_salary_distribution(df):
+    fig = px.histogram(df, x='Salary', nbins=30, title='Salary Distribution', color_discrete_sequence=['#4e54c8'])
+    fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', xaxis_title='Salary (₹)', yaxis_title='Count')
+    return fig
+
+def plot_department_salary(df):
+    fig = px.box(df, x='Department', y='Salary', title='Salary Distribution by Department', color='Department', color_discrete_sequence=px.colors.qualitative.Pastel)
+    fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', xaxis_title='Department', yaxis_title='Salary (₹)', showlegend=False)
+    return fig
+
+def plot_experience_vs_salary(df):
+    fig = px.scatter(df, x='ExperienceYears', y='Salary', color='Department', title='Experience vs Salary by Department', trendline='lowess', color_discrete_sequence=px.colors.qualitative.Pastel)
+    fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', xaxis_title='Years of Experience', yaxis_title='Salary (₹)')
+    return fig
+
+def plot_education_level_impact(df):
+    fig = px.box(df, x='EducationLevel', y='Salary', title='Salary by Education Level', color='EducationLevel', color_discrete_sequence=px.colors.qualitative.Pastel)
+    fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', xaxis_title='Education Level', yaxis_title='Salary (₹)', showlegend=False)
+    return fig
+
+def plot_productivity_vs_salary(df):
+    fig = px.scatter(df, x='ProductivityScore', y='Salary', color='Department', title='Productivity Score vs Salary by Department', trendline='lowess', color_discrete_sequence=px.colors.qualitative.Pastel)
+    fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', xaxis_title='Productivity Score', yaxis_title='Salary (₹)')
+    return fig
+
+def plot_salary_by_gender(df):
+    fig = px.box(df, x='Gender', y='Salary', title='Salary Distribution by Gender', color='Gender', color_discrete_sequence=px.colors.qualitative.Pastel)
+    fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', xaxis_title='Gender', yaxis_title='Salary (₹)', showlegend=False)
+    return fig
+
+# OLAP operations
+def perform_olap_operation(df, operation, dimensions, measures):
+    try:
+        if operation == 'drill_down':
+            return df.groupby(dimensions)[measures].mean().reset_index()
+        elif operation == 'roll_up':
+            if len(dimensions) > 1:
+                return df.groupby(dimensions[:-1])[measures].mean().reset_index()
+            else:
+                return df[measures].mean().to_frame().T
+        else:
+            return df.groupby(dimensions)[measures].mean().reset_index()
+    except Exception as e:
+        st.error(f"Error performing OLAP operation: {str(e)}")
+        return None
+
+# Clustering function
+def perform_clustering(df, selected_features, n_clusters=3):
+    try:
+        from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.manifold import TSNE
+        from sklearn.decomposition import PCA
+        
+        X = df[selected_features]
+        
+        # Impute missing values for clustering
+        imputer = SimpleImputer(strategy='mean')
+        X_imputed = imputer.fit_transform(X)
+        
+        # Scale the features
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_imputed)
+        
+        # Perform clustering
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        clusters = kmeans.fit_predict(X_scaled)
+        
+        # Create clustered dataframe
+        df_clustered = df.copy()
+        df_clustered['Cluster'] = clusters
+        
+        # Calculate cluster centers
+        df_clustered['Distance_to_Center'] = kmeans.transform(X_scaled).min(axis=1)
+        
+        # Add PCA components for visualization
+        if len(selected_features) > 2:
+            pca = PCA(n_components=2)
+            pca_result = pca.fit_transform(X_scaled)
+            df_clustered['PCA1'] = pca_result[:, 0]
+            df_clustered['PCA2'] = pca_result[:, 1]
+            
+        # Add t-SNE for non-linear dimensionality reduction
+        tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(X_scaled)-1))
+        tsne_result = tsne.fit_transform(X_scaled)
+        df_clustered['tSNE1'] = tsne_result[:, 0]
+        df_clustered['tSNE2'] = tsne_result[:, 1]
+        
+        return df_clustered
+        
+    except Exception as e:
+        st.error(f"Error performing clustering: {str(e)}")
+        return None
+
+# AI Suggestions for Salary using Gemini
+def get_ai_salary_suggestion(input_data, predicted_salary, df):
+    try:
+        # Calculate market statistics
+        dept_avg_salary = df[df['Department'] == input_data['Department']]['Salary'].mean()
+        similar_exp = df[(df['ExperienceYears'] >= input_data['ExperienceYears'] - 2) & 
+                        (df['ExperienceYears'] <= input_data['ExperienceYears'] + 2)]['Salary'].mean()
+        overall_avg = df['Salary'].mean()
+        
+        # Calculate percentile
+        percentile = (df['Salary'] < predicted_salary).sum() / len(df) * 100
+        
+        # Enhanced fallback analysis with skill recommendations
+        def get_fallback_analysis():
+            # Calculate potential salary increase
+            potential_increase = dept_avg_salary * 0.2  # 20% potential increase
+            target_salary = predicted_salary + potential_increase
+            
+            # Get common skills in department (filter out invalid entries)
+            dept_skills = set()
+            dept_df = df[df['Department'] == input_data['Department']]
+            for skillset in dept_df['Skillset'].dropna():
+                skills = [s.strip() for s in str(skillset).split(',') if s.strip() and s.strip().lower() not in ['nan', 'none', '', 'unknown']]
+                dept_skills.update(skills)
+            
+            # Get top skills by frequency (filter out invalid entries)
+            from collections import Counter
+            skill_counter = Counter()
+            for skillset in dept_df['Skillset'].dropna():
+                skills = [s.strip() for s in str(skillset).split(',') if s.strip() and s.strip().lower() not in ['nan', 'none', '', 'unknown']]
+                skill_counter.update(skills)
+            top_dept_skills = [skill for skill, count in skill_counter.most_common(8) if skill and skill.lower() not in ['nan', 'none', '', 'unknown']]
+            
+            analysis = f"""
+### 💰 Salary Improvement Plan
+
+**Predicted Salary:** ₹{predicted_salary:,.2f}  
+**Department Average:** ₹{dept_avg_salary:,.2f} ({((predicted_salary - dept_avg_salary) / dept_avg_salary * 100):+.1f}%)  
+**Target Salary (12 months):** ₹{target_salary:,.2f} (+{((target_salary - predicted_salary) / predicted_salary * 100):.1f}%)
+
+---
+
+### 🚀 TOP 5 SKILLS TO LEARN (High Salary Impact)
+
+{chr(10).join([f"{i+1}. **{skill}** - High demand in {input_data.get('Department', 'your')} department" for i, skill in enumerate(top_dept_skills[:5])]) if top_dept_skills else "1. **Cloud Computing** (AWS/Azure/GCP) - 20-30% salary boost\n2. **Data Analytics** (Python/R) - 15-25% salary boost\n3. **Project Management** (PMP/Agile) - 15-20% salary boost\n4. **Machine Learning/AI** - 25-35% salary boost\n5. **Leadership & Communication** - 10-20% salary boost"}
+
+**Learning Timeline:** 3-6 months per skill with dedicated practice
+
+---
+
+### 📋 IMMEDIATE ACTION PLAN (Next 6 Months)
+
+**Months 1-2:**
+- Enroll in 2 online courses for top priority skills
+- Set weekly learning schedule (8-10 hours/week)
+- Document current achievements
+
+**Months 3-4:**
+- Apply new skills to current projects
+- Build portfolio demonstrating expertise
+- Seek high-visibility assignments
+
+**Months 5-6:**
+- Complete 1-2 certifications
+- Present results to leadership
+- Prepare salary negotiation case
+
+---
+
+### 💼 WHAT TO IMPROVE
+
+**Performance Rating:** {input_data.get('PerformanceRating', 'N/A')}/5 → Target: {min(5, input_data.get('PerformanceRating', 3) + 1)}/5  
+- Impact: +₹{predicted_salary * 0.08:,.0f} salary increase
+
+**Productivity Score:** {input_data.get('ProductivityScore', 'N/A')}/100 → Target: {min(100, input_data.get('ProductivityScore', 75) + 15)}  
+- Impact: +₹{predicted_salary * 0.10:,.0f} salary increase
+
+**Skills:** Add 2-3 high-demand skills from the list above  
+- Impact: +₹{predicted_salary * 0.20:,.0f} salary increase
+
+**Certifications:** Complete 1-2 major certifications  
+- Impact: +₹{predicted_salary * 0.15:,.0f} salary increase
+
+---
+
+### 📈 SALARY INCREASE ROADMAP
+
+**3 Months:** +₹{predicted_salary * 0.10:,.0f} (Improve performance & productivity)  
+**6 Months:** +₹{predicted_salary * 0.25:,.0f} (Add 1-2 skills + certification)  
+**12 Months:** +₹{predicted_salary * 0.50:,.0f} (Master skills + promotion opportunity)
+
+**Total Potential:** ₹{target_salary:,.0f} in 12-18 months
+
+---
+
+### ✅ QUICK WINS (Start This Week)
+
+1. Enroll in 1 course for your #1 priority skill
+2. Set up daily 1-hour learning schedule
+3. Document 3 major achievements from last 6 months
+4. Connect with 5 professionals in your field
+5. Request feedback from your manager
+
+---
+
+**Status:** {"✅ Your salary is ABOVE average - focus on next-level skills" if predicted_salary > dept_avg_salary else f"⚠️ Below average by ₹{dept_avg_salary - predicted_salary:,.0f} - strong case for negotiation"}
+            """
+            return analysis
+    
+        prompt = f"""
+        As a compensation expert, provide focused, actionable advice to help this employee increase their salary. DO NOT suggest role changes - focus ONLY on salary improvement.
+        
+        EMPLOYEE PROFILE:
+        - Department: {input_data.get('Department', 'N/A')}
+        - Experience: {input_data.get('ExperienceYears', 'N/A')} years
+        - Performance Rating: {input_data.get('PerformanceRating', 'N/A')}/5
+        - Productivity Score: {input_data.get('ProductivityScore', 'N/A')}/100
+        - Current Skills: {input_data.get('Skillset', 'N/A')}
+        
+        SALARY DATA:
+        - Predicted Salary: ₹{predicted_salary:,.2f}
+        - Department Average: ₹{dept_avg_salary:,.2f}
+        - Target Salary (12 months): ₹{predicted_salary * 1.20:,.2f}
+        
+        Provide ONLY these sections (be concise and specific):
+        
+        1. **TOP 5 SKILLS TO LEARN** (List exactly 5 skills)
+           - Skill name, expected salary impact (%), learning time
+           - Focus on {input_data.get('Department', 'this')} department skills
+        
+        2. **WHAT TO IMPROVE** (3-4 bullet points)
+           - Performance rating improvement steps
+           - Productivity optimization tips
+           - Specific certifications to earn
+        
+        3. **6-MONTH ACTION PLAN** (Month-by-month)
+           - Months 1-2: Learning goals
+           - Months 3-4: Application goals
+           - Months 5-6: Achievement goals
+        
+        4. **SALARY NEGOTIATION STRATEGY**
+           - When to negotiate
+           - 3-4 talking points
+           - Target salary range
+        
+        Keep response under 400 words. Be specific and actionable. NO role suggestions.
+        """
+        
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content(prompt)
+        return response.text
+
+    except Exception as e:
+        # Return a clean fallback analysis without error messages
+        try:
+            return get_fallback_analysis()
+        except:
+            return f"""
+### 💼 Salary Analysis
+
+*Predicted Salary:* ₹{predicted_salary:,.2f}
+
+*Note: AI-powered insights are currently unavailable. Here's a quick analysis based on your data:*
+- Your salary is in the {get_salary_percentile(predicted_salary, df)} percentile
+- This is {'above' if predicted_salary > df['Salary'].median() else 'below'} the median salary of ₹{df['Salary'].median():,.2f}
+- Employees with similar experience typically earn between ₹{df[df['ExperienceYears'] == input_data.get('ExperienceYears', 0)]['Salary'].quantile(0.25):,.2f} and ₹{df[df['ExperienceYears'] == input_data.get('ExperienceYears', 0)]['Salary'].quantile(0.75):,.2f}
+            """
+
+# AI Suggestions for Role using Gemini
+def get_ai_role_suggestion(input_data, predicted_role, df):
+    try:
+        # Get role statistics
+        role_count = len(df[df['Designation'] == predicted_role])
+        avg_salary_for_role = df[df['Designation'] == predicted_role]['Salary'].mean()
+        total_employees = len(df)
+        
+        # Get common skills for this role
+        role_df = df[df['Designation'] == predicted_role]
+        common_skills = []
+        top_skills = []
+        if len(role_df) > 0:
+            skillsets = role_df['Skillset'].dropna()
+            for skillset in skillsets:
+                skills = [s.strip() for s in str(skillset).split(',')]
+                common_skills.extend(skills)
+            from collections import Counter
+            top_skills = Counter(common_skills).most_common(5)
+        
+        # Enhanced fallback analysis with comprehensive career guidance
+        def get_fallback_analysis():
+            # Analyze skill gaps (filter out invalid entries)
+            current_skills = set([s.strip() for s in str(input_data.get('Skillset', '')).split(',') if s.strip() and s.strip().lower() not in ['nan', 'none', '', 'unknown']])
+            
+            # Get skills distribution for this role (filter out invalid entries)
+            role_skill_counter = Counter()
+            for skillset in role_df['Skillset'].dropna():
+                skills = [s.strip() for s in str(skillset).split(',') if s.strip() and s.strip().lower() not in ['nan', 'none', '', 'unknown']]
+                role_skill_counter.update(skills)
+            
+            # Find missing high-value skills
+            top_role_skills = [skill for skill, count in role_skill_counter.most_common(10) if skill and skill.lower() not in ['nan', 'none', '', 'unknown']]
+            missing_skills = [skill for skill in top_role_skills if skill not in current_skills]
+            
+            # Determine career progression based on current role
+            # Strict order: Junior → Executive → Senior → Manager → Lead
+            role_lower = predicted_role.lower()
+            
+            # Extract base role (remove seniority prefixes)
+            base_role = predicted_role
+            
+            # Handle different role levels following strict order
+            if 'junior' in role_lower:
+                # Junior → Executive → Senior → Manager
+                base_role = predicted_role.replace('Junior', '').replace('junior', '').strip()
+                level1_role = predicted_role
+                level2_role = f"Executive{' ' + base_role if base_role else ''}"
+                level3_role = f"Senior{' ' + base_role if base_role else ''}"
+                level4_role = f"Manager{' ' + base_role if base_role else ''}"
+            elif 'executive' in role_lower:
+                # Executive → Senior → Manager → Lead
+                base_role = predicted_role.replace('Executive', '').replace('executive', '').strip()
+                level1_role = predicted_role
+                level2_role = f"Senior{' ' + base_role if base_role else ''}"
+                level3_role = f"Manager{' ' + base_role if base_role else ''}"
+                level4_role = f"Lead{' ' + base_role if base_role else ''}"
+            elif 'senior' in role_lower:
+                # Senior → Manager → Lead → Beyond Lead
+                base_role = predicted_role.replace('Senior', '').replace('senior', '').strip()
+                level1_role = predicted_role
+                level2_role = f"Manager{' ' + base_role if base_role else ''}"
+                level3_role = f"Lead{' ' + base_role if base_role else ''}"
+                level4_role = f"Senior Lead{' ' + base_role if base_role else ''}"
+            elif 'manager' in role_lower:
+                # Manager → Lead → Senior Lead → Director
+                base_role = predicted_role.replace('Manager', '').replace('manager', '').strip()
+                level1_role = predicted_role
+                level2_role = f"Lead{' ' + base_role if base_role else ''}"
+                level3_role = f"Senior Lead{' ' + base_role if base_role else ''}"
+                level4_role = "Director"
+            elif 'lead' in role_lower:
+                # Lead → Senior Lead → Director → VP
+                base_role = predicted_role.replace('Lead', '').replace('lead', '').strip()
+                level1_role = predicted_role
+                level2_role = f"Senior Lead{' ' + base_role if base_role else ''}"
+                level3_role = "Director"
+                level4_role = "VP"
+            else:
+                # Default: assume mid-level, follow order Junior → Executive → Senior → Manager → Lead
+                level1_role = predicted_role
+                level2_role = f"Senior {predicted_role}"
+                level3_role = f"Manager {predicted_role}"
+                level4_role = f"Lead {predicted_role}"
+            
+            analysis = f"""
+### 👔 Role Transition Plan: {predicted_role}
+
+**Recommended Role:** {predicted_role}  
+**Employees in this Role:** {role_count}  
+**Your Experience:** {input_data.get('ExperienceYears', 'N/A')} years  
+**Your Productivity:** {input_data.get('ProductivityScore', 'N/A')}/100
+
+---
+
+### 💼 CRITICAL SKILLS FOR {predicted_role}
+
+**Must-Have Skills:**
+{chr(10).join([f"{i+1}. **{skill}** - {role_skill_counter[skill]} employees have this" for i, skill in enumerate(top_role_skills[:4])]) if top_role_skills else "1. **Technical Expertise** - Core domain knowledge\n2. **Communication** - Stakeholder management\n3. **Problem Solving** - Analytical thinking\n4. **Project Management** - Delivery execution"}
+
+**Skills You Need to Learn:**
+{chr(10).join([f"- **{skill}** (High priority)" for skill in missing_skills[:3]]) if missing_skills else "- ✅ You have strong skill coverage for this role"}
+
+---
+
+### 📋 90-DAY ACTION PLAN
+
+**Days 1-30: Foundation**
+- Enroll in 2 courses for missing skills
+- Join {predicted_role} professional communities
+- Set up learning schedule (8-10 hours/week)
+- Connect with 3-5 professionals in this role
+
+**Days 31-60: Skill Building**
+- Complete first certification
+- Apply new skills to current projects
+- Build 2-3 portfolio projects
+- Seek feedback from peers
+
+**Days 61-90: Demonstration**
+- Demonstrate measurable results
+- Update resume and LinkedIn
+- Request role transition discussion with manager
+- Achieve productivity score of 85+
+
+---
+
+### 📈 CAREER PROGRESSION PATH
+
+**Level 1: {level1_role} (Current)**
+- **Timeline:** Now - 18 months
+- **Focus:** Master core technical skills, build credibility
+- **Key Deliverables:** Complete 2-3 major projects successfully
+- **Skills Needed:** {', '.join(top_role_skills[:3]) if top_role_skills else 'Technical expertise, Communication, Problem solving'}
+- **How to Progress:** Consistently deliver quality work, earn 1-2 certifications, improve productivity to 85+
+
+**Level 2: {level2_role}**
+- **Timeline:** 18-36 months from now
+- **Focus:** Lead projects, mentor team members
+- **Key Deliverables:** Lead 3-5 major projects, mentor 2-3 junior members
+- **Skills Needed:** Advanced technical skills, Leadership, Strategic planning
+- **How to Progress:** Demonstrate leadership, take ownership of complex problems, build cross-team relationships
+
+**Level 3: {level3_role}**
+- **Timeline:** 3-4 years from now
+- **Focus:** Technical leadership, architecture decisions
+- **Key Deliverables:** Define technical strategy, lead team of 5-8 people
+- **Skills Needed:** System design, Team leadership, Stakeholder management
+- **How to Progress:** Drive technical vision, influence across teams, deliver business impact
+
+**Level 4: {level4_role}**
+- **Timeline:** 5+ years from now
+- **Focus:** People management, strategic planning, business alignment
+- **Key Deliverables:** Manage team of 10+ people, drive department goals
+- **Skills Needed:** People management, Business strategy, Executive communication
+- **How to Progress:** Build strong teams, align technical work with business goals, demonstrate executive presence
+
+---
+
+### 🎓 RECOMMENDED CERTIFICATIONS
+
+1. **Role-Specific Certification** - Directly related to {predicted_role}
+2. **Cloud Platform** - AWS/Azure/GCP (based on company tech stack)
+3. **Agile/Scrum** - Project management methodology
+4. **Data Analytics** - Power BI, Tableau, or Python
+
+*Priority:* Complete 1-2 certifications in next 6 months
+
+---
+
+### 📊 PERFORMANCE METRICS FOR {predicted_role}
+
+**Focus Areas:**
+- Project delivery success rate
+- Quality of work output
+- Collaboration and teamwork
+- Technical skill proficiency
+- Problem-solving effectiveness
+
+**Target:** Maintain productivity score above 85/100
+
+---
+
+### ✅ IMMEDIATE NEXT STEPS
+
+1. **This Week:** Start learning {missing_skills[0] if missing_skills else "your #1 priority skill"}
+2. **This Month:** Enroll in first certification course
+3. **This Month:** Connect with 5 {predicted_role} professionals
+4. **Next 30 Days:** Document 3 major achievements
+5. **Next 30 Days:** Schedule career discussion with manager
+
+---
+
+**Status:** ✅ You have {len(current_skills)} relevant skills. Focus on mastering the missing skills above to excel in this role.
+            """
+            return analysis
+    
+        prompt = f"""
+        As a career development expert, provide focused guidance for transitioning to this role. Focus ONLY on skills, learning path, and role requirements. DO NOT mention salary, compensation, or negotiation.
+        
+        PROFILE:
+        - Target Role: {predicted_role}
+        - Experience: {input_data.get('ExperienceYears', 'N/A')} years
+        - Productivity: {input_data.get('ProductivityScore', 'N/A')}/100
+        - Current Skills: {input_data.get('Skillset', 'N/A')}
+        - Employees in this Role: {role_count}
+        
+        Provide ONLY these sections (be concise and specific):
+        
+        1. **CRITICAL SKILLS FOR {predicted_role}** (List exactly 4-5 skills)
+           - Must-have skills with proficiency level needed
+           - Learning resources (specific courses, certifications)
+           - Time to acquire each skill (weeks/months)
+        
+        2. **90-DAY ACTION PLAN**
+           - Days 1-30: Foundation and learning goals
+           - Days 31-60: Skill application goals
+           - Days 61-90: Performance demonstration goals
+        
+        3. **CAREER PROGRESSION PATH** (4 levels)
+           - Level 1: {predicted_role} (Current) - Timeline, focus, how to progress
+           - Level 2: Senior {predicted_role} - Timeline, key deliverables, skills needed
+           - Level 3: Lead {predicted_role} - Timeline, responsibilities, progression steps
+           - Level 4: Manager/Principal {predicted_role} - Timeline, leadership requirements
+           - For each level, specify: Timeline, Focus, Key Deliverables, Skills Needed, How to Progress
+        
+        4. **RECOMMENDED CERTIFICATIONS** (Top 3-4)
+           - Specific certification names for {predicted_role}
+           - Expected impact on role performance
+           - Priority order (which to do first)
+        
+        5. **PERFORMANCE METRICS**
+           - Key performance indicators for this role
+           - What success looks like
+        
+        Keep response under 400 words. Be specific and actionable. Focus ONLY on role improvement, NOT salary.
+        """
+        
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content(prompt)
+        return response.text
+
+    except Exception as e:
+        # Return a clean fallback analysis without error messages
+        try:
+            return get_fallback_analysis()
+        except:
+            role_dist = df['Designation'].value_counts(normalize=True) * 100
+            return f"""
+### 👔 Role Classification Analysis
+
+*Recommended Role:* {predicted_role}
+
+*Note: AI-powered insights are currently unavailable. Here's a quick analysis based on your data:*
+- This role represents {role_dist.get(predicted_role, 0):.1f}% of the workforce
+- Most common roles in the organization:
+  1. {role_dist.index[0]} ({role_dist.iloc[0]:.1f}%)
+  2. {role_dist.index[1]} ({role_dist.iloc[1]:.1f}%)
+  3. {role_dist.index[2]} ({role_dist.iloc[2]:.1f}%)
+
+*To get AI-powered insights, please check your internet connection and try again.*
+            """
+
+# Display model metrics
+def display_model_metrics(metrics):
+    if not metrics:
+        return
+    st.subheader("📊 Model Performance Metrics")
+    tab1, tab2, tab3 = st.tabs(["Salary Prediction", "Role Classification", "Feature Importance"])
+    with tab1:
+        st.markdown("### Salary Prediction Performance")
+        if 'salary_metrics' in metrics:
+            sal_metrics = metrics['salary_metrics']
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("R² Score", f"{sal_metrics['r2']:.3f}", help="R² score (coefficient of determination).")
+            with col2:
+                st.metric("RMSE", f"{sal_metrics['rmse']:,.2f}", help="Root Mean Squared Error.")
+            with col3:
+                st.metric("MAE", f"{sal_metrics['mae']:,.2f}", help="Mean Absolute Error.")
+            if 'feature_importance' in sal_metrics:
+                st.plotly_chart(sal_metrics['feature_importance'], use_container_width=True)
+    with tab2:
+        st.markdown("### Role Classification Performance")
+        if 'role_metrics' in metrics:
+            role_metrics = metrics['role_metrics']
+            st.metric("Accuracy", f"{role_metrics['accuracy']:.3f}", help="Overall classification accuracy")
+            if 'classification_report' in role_metrics:
+                report = role_metrics['classification_report']
+                if 'accuracy' in report:
+                    del report['accuracy']
+                report_df = pd.DataFrame(report).transpose()
+                st.dataframe(report_df.style.background_gradient(cmap='Blues'), use_container_width=True)
+    with tab3:
+        st.markdown("### Feature Importance")
+        if 'feature_importance_data' in metrics and not metrics['feature_importance_data'].empty:
+            fig = px.bar(
+                metrics['feature_importance_data'],
+                x='Importance', y='Feature', orientation='h',
+                title='Feature Importance for Salary Prediction',
+                labels={'Importance': 'Importance Score', 'Feature': ''}
+            )
+            fig.update_layout(showlegend=False, height=400)
+            st.plotly_chart(fig, use_container_width=True)
+
+# Main app
+def main():
+    st.title("💰 Salary Prediction & Role Classification")
+    st.markdown("""
+        📊 Employee Analytics Dashboard
+        Upload your employee dataset to analyze salaries, predict compensation, and suggest roles.
+    """)
+    st.markdown("---")
+    
+    # Display data status in sidebar
+    with st.sidebar:
+        st.markdown("### 📊 Data Status")
+        if st.session_state.df is not None:
+            st.success(f"✅ Dataset loaded: {st.session_state.df.shape[0]} rows, {st.session_state.df.shape[1]} columns")
+            if st.session_state.model_salary is not None:
+                st.success("✅ Models trained")
+            else:
+                st.warning("⚠ Models not trained")
+        else:
+            st.warning("⚠ No dataset loaded")
+        st.markdown("---")
+        
+        selected = option_menu(
+            menu_title=None,
+            options=["Home", "Data Upload", "Exploratory Analysis", "OLAP Operations", "Clustering", "Salary Prediction", "Role Classification"],
+            icons=['house', 'cloud-upload', 'bar-chart', 'table', 'diagram-3', 'currency-dollar', 'person-badge'],
+            default_index=0,
+            styles={
+                "container": {"padding": "5px", "background-color": "#f8f9fa"},
+                "icon": {"color": "#4e54c8", "font-size": "16px"},
+                "nav-link": {"font-size": "16px", "text-align": "left", "margin": "5px 0", "border-radius": "8px", "padding": "8px 15px", "color": "#2c3e50", "--hover-color": "#e9ecef"},
+                "nav-link-selected": {"background-color": "#4e54c8", "color": "white", "font-weight": "600"}
+            }
+        )
+    if selected == "Home":
+        st.markdown("""
+            ## Welcome to the Salary Prediction & Role Classification System
+            This application helps you:
+            - Analyze employee data
+            - Predict salaries
+            - Classify roles
+            - Perform OLAP operations
+            - Cluster employees
+            ### How to use:
+            1. Upload dataset in Data Upload
+            2. Explore data in Exploratory Analysis
+            3. Predict salaries and classify roles
+            4. Perform OLAP and clustering
+            ### Required Columns:
+            - Age, Gender, Department, Designation, ExperienceYears
+            - Skillset, Salary, ProductivityScore, WorkLocation
+            - EducationLevel, PerformanceRating, LastPromotionYear
+        """)
+    elif selected == "Data Upload":
+        st.header("📤 Upload Your Dataset")
+        st.markdown("---")
+        
+        # Show if data is already loaded
+        if st.session_state.df is not None:
+            st.info(f"ℹ Dataset already loaded with {st.session_state.df.shape[0]} rows and {st.session_state.df.shape[1]} columns")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Number of Rows", st.session_state.df.shape[0])
+            with col2:
+                st.metric("Number of Columns", st.session_state.df.shape[1])
+            
+            st.subheader("Data Preview")
+            st.dataframe(st.session_state.df.head())
+            
+            if st.button("Clear Current Dataset"):
+                st.session_state.df = None
+                st.session_state.model_salary = None
+                st.session_state.model_role = None
+                st.session_state.label_encoders = {}
+                st.rerun()
+        
+        uploaded_file = st.file_uploader("Choose a CSV file", type=["csv"], key="file_uploader")
+        if uploaded_file is not None:
+            try:
+                df = pd.read_csv(uploaded_file)
+                # Only update if it's a new file or first time
+                if st.session_state.df is None or st.session_state.df.shape != df.shape:
+                    st.session_state.df = df
+                    st.success("✅ Dataset loaded successfully!")
+                
+                df = st.session_state.df
+                
+                # Handle missing values
+                st.subheader("Handle Missing Values")
+                null_counts = df.isnull().sum()
+                if null_counts.sum() > 0:
+                    st.warning("Missing values detected.")
+                    st.dataframe(null_counts[null_counts > 0].rename("Missing Count"))
+                    handling_option = st.selectbox("How to handle missing values?", ["Drop rows with any missing values", "Impute missing values", "Do nothing"])
+                    if handling_option == "Drop rows with any missing values":
+                        if st.button("Apply"):
+                            df = df.dropna()
+                            st.session_state.df = df
+                            st.success("Rows with missing values dropped.")
+                    elif handling_option == "Impute missing values":
+                        num_strategy = st.selectbox("Imputation strategy for numeric columns", ["mean", "median", "constant"])
+                        fill_value_num = None
+                        if num_strategy == "constant":
+                            fill_value_num = st.number_input("Fill value for numeric", value=0.0)
+                        cat_strategy = st.selectbox("Imputation strategy for categorical columns", ["most_frequent", "constant"])
+                        fill_value_cat = None
+                        if cat_strategy == "constant":
+                            fill_value_cat = st.text_input("Fill value for categorical", value="Unknown")
+                        if st.button("Apply"):
+                            df = impute_missing_values(df, num_strategy, fill_value_num, cat_strategy, fill_value_cat)
+                            st.session_state.df = df
+                            st.success("Missing values imputed.")
+                else:
+                    st.info("No missing values detected.")
+                if st.button("Train Models", key="train_models_btn"):
+                    try:
+                        if st.session_state.df is None or st.session_state.df.empty:
+                            st.error("❌ No data available for training. Please upload a dataset first.")
+                        else:
+                            with st.spinner("🔄 Training models (this may take a few minutes)..."):
+                                # Clear previous models and metrics
+                                st.session_state.model_salary = None
+                                st.session_state.model_role = None
+                                
+                                # Train models
+                                metrics = train_models(st.session_state.df)
+                                
+                                if metrics:
+                                    st.success("✅ Models trained successfully!")
+                                    st.balloons()
+                                    display_model_metrics(metrics)
+                                    
+                                    # Store training status
+                                    st.session_state.models_trained = True
+                                    st.session_state.last_training_time = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+                                    
+                                    # Show training summary
+                                    st.subheader("Training Summary")
+                                    col1, col2 = st.columns(2)
+                                    with col1:
+                                        st.metric("Salary Model R² Score", f"{metrics['salary_metrics']['r2']:.3f}")
+                                        st.metric("Salary RMSE", f"₹{metrics['salary_metrics']['rmse']:,.2f}")
+                                    with col2:
+                                        st.metric("Role Model Accuracy", f"{metrics['role_metrics']['accuracy']:.1%}")
+                                        st.metric("Last Trained", st.session_state.last_training_time)
+                    except Exception as e:
+                        st.error(f"❌ Error during model training: {str(e)}")
+                        st.error("Please check your data and try again.")
+            except Exception as e:
+                st.error(f"Error loading file: {str(e)}")
+    elif selected == "Exploratory Analysis":
+        st.header("📊 Exploratory Data Analysis")
+        st.markdown("---")
+        if st.session_state.df is None:
+            st.warning("Please upload a dataset first.")
+        else:
+            df = st.session_state.df
+            st.subheader("Visualizations")
+            viz_option = st.selectbox(
+                "Select a visualization:",
+                ["Salary Distribution", "Department-wise Salary", "Experience vs Salary", "Education Level Impact", "Productivity vs Salary", "Salary by Gender"],
+                key="viz_option"
+            )
+            if viz_option == "Salary Distribution":
+                fig = plot_salary_distribution(df)
+                st.plotly_chart(fig, use_container_width=True)
+            elif viz_option == "Department-wise Salary":
+                fig = plot_department_salary(df)
+                st.plotly_chart(fig, use_container_width=True)
+            elif viz_option == "Experience vs Salary":
+                fig = plot_experience_vs_salary(df)
+                st.plotly_chart(fig, use_container_width=True)
+            elif viz_option == "Education Level Impact":
+                fig = plot_education_level_impact(df)
+                st.plotly_chart(fig, use_container_width=True)
+            elif viz_option == "Productivity vs Salary":
+                fig = plot_productivity_vs_salary(df)
+                st.plotly_chart(fig, use_container_width=True)
+            elif viz_option == "Salary by Gender":
+                fig = plot_salary_by_gender(df)
+                st.plotly_chart(fig, use_container_width=True)
+            st.subheader("Data Statistics")
+            st.dataframe(df.describe())
+    elif selected == "Salary Prediction":
+        st.header("💰 Salary Prediction")
+        st.markdown("---")
+        if st.session_state.df is None:
+            st.warning("⚠ Please upload a dataset first from the 'Data Upload' page.")
+            st.info("👈 Navigate to 'Data Upload' in the sidebar to get started.")
+        elif st.session_state.model_salary is None:
+            st.warning("⚠ Models not trained yet. Please train the models first.")
+            st.info("👈 Go to 'Data Upload' page and click 'Train Models' button.")
+        else:
+            df = st.session_state.df
+            # Convert categorical columns to string to avoid type errors
+            df['Department'] = df['Department'].astype(str)
+            df['EducationLevel'] = df['EducationLevel'].astype(str)
+            df['Gender'] = df['Gender'].astype(str)
+            df['Skillset'] = df['Skillset'].astype(str)
+            departments = sorted(df['Department'].unique().tolist())
+            education_levels = sorted(df['EducationLevel'].unique().tolist())
+            gender_options = sorted(df['Gender'].unique().tolist())
+            # Extract unique individual skills
+            all_skills = set()
+            for skillset in df['Skillset'].dropna():
+                skills = [s.strip() for s in skillset.split(',')]
+                all_skills.update(skills)
+            unique_skills = sorted(list(all_skills))
+            with st.form("salary_prediction_form"):
+                st.subheader("Employee Details")
+                col1, col2 = st.columns(2)
+                # Initialize session state for salary form if not exists
+                if 'salary_form_data' not in st.session_state:
+                    st.session_state.salary_form_data = {
+                        'age': 30,
+                        'gender': gender_options[0] if gender_options else '',
+                        'department': departments[0] if departments else '',
+                        'education': education_levels[0] if education_levels else '',
+                        'skillsets': [],
+                        'experience': 5,
+                        'performance': 3,
+                        'last_promotion': 2,
+                        'productivity': 75
+                    }
+                
+                with col1:
+                    # Update form data in session state on change
+                    st.session_state.salary_form_data['age'] = st.number_input(
+                        "Age", 
+                        min_value=18, 
+                        max_value=70, 
+                        value=st.session_state.salary_form_data['age'], 
+                        step=1
+                    )
+                    st.session_state.salary_form_data['gender'] = st.selectbox(
+                        "Gender", 
+                        gender_options, 
+                        index=gender_options.index(st.session_state.salary_form_data['gender']) if st.session_state.salary_form_data['gender'] in gender_options else 0
+                    )
+                    st.session_state.salary_form_data['department'] = st.selectbox(
+                        "Department", 
+                        departments, 
+                        index=departments.index(st.session_state.salary_form_data['department']) if st.session_state.salary_form_data['department'] in departments else 0
+                    )
+                    st.session_state.salary_form_data['education'] = st.selectbox(
+                        "Education Level", 
+                        education_levels, 
+                        index=education_levels.index(st.session_state.salary_form_data['education']) if st.session_state.salary_form_data['education'] in education_levels else 0
+                    )
+                    st.session_state.salary_form_data['skillsets'] = st.multiselect(
+                        "Skillsets", 
+                        unique_skills,
+                        default=st.session_state.salary_form_data['skillsets']
+                    )
+                with col2:
+                    st.session_state.salary_form_data['experience'] = st.number_input(
+                        "Years of Experience", 
+                        min_value=0, 
+                        max_value=50, 
+                        value=st.session_state.salary_form_data['experience'], 
+                        step=1
+                    )
+                    st.session_state.salary_form_data['performance'] = st.slider(
+                        "Performance Rating (1-5)", 
+                        1, 5, 
+                        value=st.session_state.salary_form_data['performance']
+                    )
+                    st.session_state.salary_form_data['last_promotion'] = st.number_input(
+                        "Years Since Last Promotion", 
+                        min_value=0, 
+                        max_value=30, 
+                        value=st.session_state.salary_form_data['last_promotion'], 
+                        step=1
+                    )
+                    st.session_state.salary_form_data['productivity'] = st.slider(
+                        "Productivity Score (1-100)", 
+                        1, 100, 
+                        value=st.session_state.salary_form_data['productivity']
+                    )
+                submitted = st.form_submit_button("Predict Salary")
+                if submitted:
+                    input_data = {
+                        'Age': st.session_state.salary_form_data['age'],
+                        'Gender': st.session_state.salary_form_data['gender'],
+                        'Department': st.session_state.salary_form_data['department'],
+                        'ExperienceYears': st.session_state.salary_form_data['experience'],
+                        'EducationLevel': st.session_state.salary_form_data['education'],
+                        'PerformanceRating': st.session_state.salary_form_data['performance'],
+                        'LastPromotionYear': st.session_state.salary_form_data['last_promotion'],
+                        'ProductivityScore': st.session_state.salary_form_data['productivity'],
+                        'Skillset': ', '.join(st.session_state.salary_form_data['skillsets'])
+                    }
+                    with st.spinner("Predicting salary..."):
+                        predicted_salary = predict_salary(input_data)
+                        if predicted_salary is not None:
+                            # Save to session state
+                            st.session_state.last_salary_prediction = predicted_salary
+                            st.session_state.salary_input_data = input_data
+                            # Generate AI suggestion once and cache it
+                            ai_suggestion = get_ai_salary_suggestion(input_data, predicted_salary, df)
+                            st.session_state.last_salary_ai_suggestion = ai_suggestion
+                            
+            # Display last prediction if exists
+            if st.session_state.last_salary_prediction is not None and st.session_state.salary_input_data is not None:
+                predicted_salary = st.session_state.last_salary_prediction
+                input_data = st.session_state.salary_input_data
+                
+                st.success(f"✅ Predicted Salary: ₹{predicted_salary:,.2f}")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Predicted Salary", f"₹{predicted_salary:,.2f}")
+                fig = go.Figure()
+                fig.add_trace(go.Histogram(x=df['Salary'], name='Salary Distribution', marker_color='#4e54c8', opacity=0.75))
+                fig.add_vline(x=predicted_salary, line_dash="dash", line_color="red", annotation_text=f"Predicted: ₹{predicted_salary:,.2f}", annotation_position="top")
+                fig.update_layout(title="Salary Distribution with Prediction", xaxis_title="Salary (₹)", yaxis_title="Count", plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # AI Suggestions
+                st.markdown("---")
+                st.subheader("🤖 AI-Powered Insights & Recommendations")
+                # Display cached AI suggestion instead of regenerating
+                if st.session_state.last_salary_ai_suggestion is not None:
+                    st.markdown(st.session_state.last_salary_ai_suggestion)
+                else:
+                    with st.spinner("Generating AI insights..."):
+                        ai_suggestion = get_ai_salary_suggestion(input_data, predicted_salary, df)
+                        st.session_state.last_salary_ai_suggestion = ai_suggestion
+                        st.markdown(ai_suggestion)
+    elif selected == "Role Classification":
+        st.header("👔 Role Classification")
+        st.markdown("---")
+        if st.session_state.df is None:
+            st.warning("⚠ Please upload a dataset first from the 'Data Upload' page.")
+            st.info("👈 Navigate to 'Data Upload' in the sidebar to get started.")
+        elif st.session_state.model_role is None:
+            st.warning("⚠ Models not trained yet. Please train the models first.")
+            st.info("👈 Go to 'Data Upload' page and click 'Train Models' button.")
+        else:
+            df = st.session_state.df
+            with st.form("role_classification_form"):
+                st.subheader("Employee Details")
+                col1, col2 = st.columns(2)
+                # Initialize session state for forms if not exists
+                if 'salary_form_data' not in st.session_state:
+                    st.session_state.salary_form_data = {
+                        'age': 30,
+                        'gender': '',
+                        'department': '',
+                        'education': '',
+                        'skillsets': [],
+                        'experience': 5,
+                        'performance': 3,
+                        'last_promotion': 2,
+                        'productivity': 75
+                    }
+                    
+                # Initialize role form data
+                if 'role_form_data' not in st.session_state:
+                    st.session_state.role_form_data = {
+                        'salary': 50000,
+                        'experience': 5,
+                        'productivity': 75,
+                        'skillsets': []
+                    }
+                    
+                # Initialize OLAP form data
+                if 'olap_form_data' not in st.session_state:
+                    st.session_state.olap_form_data = {
+                        'operation': 'drill_down',
+                        'dimensions': [],
+                        'measures': [],
+                        'slice_dimension': '',
+                        'slice_values': []
+                    }
+                    
+                # Initialize clustering form data
+                if 'clustering_form_data' not in st.session_state:
+                    st.session_state.clustering_form_data = {
+                        'selected_features': ['Salary', 'ExperienceYears', 'ProductivityScore'],
+                        'n_clusters': 3
+                    }                    
+                # Extract unique individual skills
+                all_skills = set()
+                for skillset in df['Skillset'].dropna():
+                    skills = [s.strip() for s in skillset.split(',')]
+                    all_skills.update(skills)
+                unique_skills = sorted(list(all_skills))
+                
+                with col1:
+                    st.session_state.role_form_data['salary'] = st.number_input(
+                        "Current Salary", 
+                        min_value=0, 
+                        value=st.session_state.role_form_data['salary'], 
+                        step=1000
+                    )
+                with col2:
+                    st.session_state.role_form_data['experience'] = st.number_input(
+                        "Years of Experience", 
+                        min_value=0, 
+                        max_value=50, 
+                        value=st.session_state.role_form_data['experience'], 
+                        step=1
+                    )
+                    st.session_state.role_form_data['productivity'] = st.slider(
+                        "Productivity Score (1-100)", 
+                        1, 100, 
+                        value=st.session_state.role_form_data['productivity']
+                    )
+                    st.session_state.role_form_data['skillsets'] = st.multiselect(
+                        "Skillsets", 
+                        unique_skills,
+                        default=st.session_state.role_form_data['skillsets']
+                    )
+                submitted = st.form_submit_button("Classify Role")
+                if submitted:
+                    input_data = {
+                        'Salary': st.session_state.role_form_data['salary'],
+                        'ExperienceYears': st.session_state.role_form_data['experience'],
+                        'ProductivityScore': st.session_state.role_form_data['productivity'],
+                        'Skillset': ', '.join(st.session_state.role_form_data['skillsets'])
+                    }
+                    with st.spinner("Classifying role..."):
+                        predicted_role = classify_role(input_data)
+                        if predicted_role is not None:
+                            # Save to session state
+                            st.session_state.last_role_prediction = predicted_role
+                            st.session_state.role_input_data = input_data
+                            # Generate AI suggestion once and cache it
+                            ai_role_suggestion = get_ai_role_suggestion(input_data, predicted_role, df)
+                            st.session_state.last_role_ai_suggestion = ai_role_suggestion
+                            
+            # Display last prediction if exists
+            if st.session_state.last_role_prediction is not None and st.session_state.role_input_data is not None:
+                predicted_role = st.session_state.last_role_prediction
+                input_data = st.session_state.role_input_data
+                
+                st.success(f"✅ Recommended Role: {predicted_role}")
+                role_counts = df['Designation'].value_counts().reset_index()
+                role_counts.columns = ['Role', 'Count']
+                fig = px.pie(role_counts, values='Count', names='Role', title='Role Distribution', hole=0.4, color_discrete_sequence=px.colors.qualitative.Pastel)
+                if predicted_role in role_counts['Role'].values:
+                    role_index = role_counts[role_counts['Role'] == predicted_role].index[0]
+                    fig.update_traces(marker=dict(colors=['#FFA15A' if i == role_index else '#636EFA' for i in range(len(role_counts))], line=dict(color='#FFFFFF', width=2)))
+                fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', showlegend=True, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                st.plotly_chart(fig, use_container_width=True)
+                if predicted_role in df['Designation'].values:
+                    role_skills = df[df['Designation'] == predicted_role]['Skillset'].value_counts().head(5)
+                    if len(role_skills) > 0:
+                        st.subheader("Common Skills for This Role:")
+                        for skill, count in role_skills.items():
+                            st.markdown(f"- {skill} ({count} employees)")
+                
+                # AI Suggestions for Role
+                st.markdown("---")
+                st.subheader("🤖 AI-Powered Career Insights & Recommendations")
+                # Display cached AI suggestion instead of regenerating
+                if st.session_state.last_role_ai_suggestion is not None:
+                    st.markdown(st.session_state.last_role_ai_suggestion)
+                else:
+                    with st.spinner("Generating AI career insights..."):
+                        ai_role_suggestion = get_ai_role_suggestion(input_data, predicted_role, df)
+                        st.session_state.last_role_ai_suggestion = ai_role_suggestion
+                        st.markdown(ai_role_suggestion)
+    elif selected == "OLAP Operations":
+        st.header("📈 OLAP Operations")
+        st.markdown("---")
+        if st.session_state.df is None:
+            st.warning("Please upload a dataset first.")
+        else:
+            df = st.session_state.df
+            st.subheader("OLAP Cube Operations")
+            numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
+            categorical_cols = df.select_dtypes(include=['object']).columns.tolist()
+            col1, col2 = st.columns(2)
+            with col1:
+                dimensions = st.multiselect("Select Dimensions (for grouping):", options=categorical_cols, default=[c for c in ['Department', 'EducationLevel'] if c in categorical_cols][:2])
+                operation = st.selectbox("Select OLAP Operation:", ["drill_down", "roll_up", "slice", "dice", "pivot"])
+            with col2:
+                measures = st.multiselect("Select Measures (for aggregation):", options=numeric_cols, default=[m for m in ['Salary', 'ProductivityScore'] if m in numeric_cols][:2])
+            if operation in ["slice", "dice"]:
+                slice_dimension = st.selectbox("Select dimension to filter:", categorical_cols)
+                slice_values = st.multiselect(f"Select {slice_dimension} values to keep:", options=df[slice_dimension].unique().tolist())
+            if st.button("Apply OLAP Operation"):
+                if not dimensions or not measures:
+                    st.warning("Please select at least one dimension and one measure.")
+                else:
+                    with st.spinner("Performing OLAP operation..."):
+                        result = perform_olap_operation(df, operation, dimensions, measures)
+                        if result is not None:
+                            st.subheader("OLAP Result")
+                            st.dataframe(result.style.background_gradient(cmap='Blues'))
+                            if len(dimensions) == 1 and len(measures) == 1:
+                                fig = px.bar(result, x=dimensions[0], y=measures[0], title=f"{operation.title()} - {dimensions[0]} by {measures[0]}", color=dimensions[0], color_discrete_sequence=px.colors.qualitative.Pastel)
+                                fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', xaxis_title=dimensions[0], yaxis_title=measures[0], showlegend=False)
+                                st.plotly_chart(fig, use_container_width=True)
+                            elif len(dimensions) == 2 and len(measures) == 1:
+                                pivot_df = result.pivot(index=dimensions[0], columns=dimensions[1], values=measures[0])
+                                fig = px.imshow(pivot_df, labels=dict(x=dimensions[1], y=dimensions[0], color=measures[0]), title=f"{operation.title()} - {dimensions[0]} vs {dimensions[1]} by {measures[0]}", color_continuous_scale='Blues')
+                                fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', xaxis_title=dimensions[1], yaxis_title=dimensions[0])
+                                st.plotly_chart(fig, use_container_width=True)
+                            elif operation == "slice" and slice_dimension and slice_values:
+                                sliced_df = df[df[slice_dimension].isin(slice_values)]
+                                st.subheader(f"Sliced Data - {slice_dimension} in {', '.join(slice_values)}")
+                                st.dataframe(sliced_df)
+                                st.subheader("Summary Statistics")
+                                st.dataframe(sliced_df[measures].describe())
+                            elif operation == "dice" and slice_dimension and slice_values:
+                                diced_df = df[df[slice_dimension].isin(slice_values)]
+                                st.subheader(f"Diced Data - {slice_dimension} in {', '.join(slice_values)}")
+                                st.dataframe(diced_df[dimensions + measures])
+                                if dimensions and measures:
+                                    st.subheader("Aggregated View")
+                                    agg_df = diced_df.groupby(dimensions)[measures].mean().reset_index()
+                                    st.dataframe(agg_df.style.background_gradient(cmap='Blues'))
+                            elif operation == "pivot":
+                                if len(dimensions) >= 2:
+                                    pivot_df = df.pivot_table(index=dimensions[0], columns=dimensions[1], values=measures[0], aggfunc='mean', fill_value=0)
+                                    st.subheader("Pivot Table")
+                                    st.dataframe(pivot_df.style.background_gradient(cmap='Blues'))
+                                    fig = px.imshow(pivot_df, labels=dict(x=dimensions[1], y=dimensions[0], color=measures[0]), title=f"Pivot Heatmap - {dimensions[0]} vs {dimensions[1]}", color_continuous_scale='Blues')
+                                    fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
+                                    st.plotly_chart(fig, use_container_width=True)
+                                else:
+                                    st.warning("Pivot operation requires at least 2 dimensions.")
+    elif selected == "Clustering":
+        st.header("🎯 Employee Clustering")
+        st.markdown("---")
+        if st.session_state.df is None:
+            st.warning("Please upload a dataset first.")
+        else:
+            df = st.session_state.df
+            st.subheader("Cluster Employees")
+            
+            # Get numeric columns for clustering
+            numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
+            
+            # Initialize clustering parameters in session state if not exists
+            if 'clustering_params' not in st.session_state:
+                st.session_state.clustering_params = {
+                    'selected_features': ['Salary', 'ExperienceYears', 'ProductivityScore'],
+                    'n_clusters': 3,
+                    'df_clustered': None,
+                    'cluster_metrics': None,
+                    'last_cluster_id': None,
+                    'clustering_done': False,
+                    'plot_type': '3D Scatter',
+                    'color_theme': 'Plotly'
+                }
+            
+            # Use session state for form values
+            selected_features = st.multiselect(
+                "Select features for clustering:", 
+                options=numeric_cols, 
+                default=st.session_state.clustering_params['selected_features']
+            )
+            
+            n_clusters = st.slider(
+                "Number of clusters:", 
+                min_value=2, 
+                max_value=min(10, len(df) - 1),  # Can't have more clusters than samples
+                value=st.session_state.clustering_params['n_clusters']
+            )
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🔍 Perform Clustering", use_container_width=True):
+                    if len(selected_features) < 2:
+                        st.warning("Please select at least 2 features for clustering.")
+                    else:
+                        with st.spinner("Performing clustering..."):
+                            # Update session state with new parameters
+                            st.session_state.clustering_params.update({
+                                'selected_features': selected_features,
+                                'n_clusters': n_clusters,
+                                'df_clustered': None,  # Reset clustered data
+                                'cluster_metrics': None
+                            })
+                            
+                            # Perform clustering
+                            df_clustered = perform_clustering(df, selected_features, n_clusters)
+                            
+                            # Store results in session state
+                            st.session_state.clustering_params['df_clustered'] = df_clustered
+                            
+                            # Calculate and store cluster metrics
+                            cluster_metrics = {}
+                            for cluster_id in sorted(df_clustered['Cluster'].unique()):
+                                cluster_data = df_clustered[df_clustered['Cluster'] == cluster_id]
+                                cluster_metrics[cluster_id] = {
+                                    'size': len(cluster_data),
+                                    'avg_salary': cluster_data['Salary'].mean(),
+                                    'avg_experience': cluster_data['ExperienceYears'].mean(),
+                                    'common_role': cluster_data['Designation'].mode()[0] if 'Designation' in cluster_data.columns else 'N/A',
+                                    'common_skills': cluster_data['Skillset'].str.split(',').explode().str.strip().value_counts().head(3).to_dict() if 'Skillset' in cluster_data.columns else {}
+                                }
+                            st.session_state.clustering_params['cluster_metrics'] = cluster_metrics
+                            
+                            st.success(f"✅ Clustering completed with {n_clusters} clusters!")
+                            
+                            # Rerun to update the display
+                            st.rerun()
+                            
+            with col2:
+                if st.session_state.clustering_params.get('df_clustered') is not None:
+                    if st.button("🔄 Clear Clustering Results", use_container_width=True):
+                        st.session_state.clustering_params['df_clustered'] = None
+                        st.session_state.clustering_params['cluster_metrics'] = None
+                        st.rerun()
+            
+            # Display clustering results if available
+            if st.session_state.clustering_params.get('df_clustered') is not None:
+                df_clustered = st.session_state.clustering_params['df_clustered']
+                cluster_metrics = st.session_state.clustering_params['cluster_metrics']
+                        
+                # Update clustering_done flag
+                st.session_state.clustering_params['clustering_done'] = True
+                        
+                # Display clustering results
+                st.subheader("Clustering Results")
+                st.write(f"Clustered {len(df_clustered)} employees into {n_clusters} clusters")
+                
+                # Show cluster sizes and basic info
+                cluster_sizes = df_clustered['Cluster'].value_counts().sort_index()
+                
+                # Create tabs for different visualizations
+                tab1, tab2, tab3 = st.tabs(["Cluster Overview", "Visualization", "Detailed Analysis"])
+                
+                with tab1:
+                    # Cluster distribution pie chart
+                    col1, col2 = st.columns([1, 2])
+                    with col1:
+                        fig_pie = px.pie(
+                            names=[f'Cluster {i}' for i in cluster_sizes.index], 
+                            values=cluster_sizes.values,
+                            title='Cluster Distribution',
+                            color_discrete_sequence=px.colors.qualitative.Pastel,
+                            hole=0.4
+                        )
+                        fig_pie.update_traces(textposition='inside', textinfo='percent+label')
+                        st.plotly_chart(fig_pie, use_container_width=True)
+                    
+                    with col2:
+                        # Cluster metrics table
+                        metrics_data = []
+                        for cluster_id, metrics in cluster_metrics.items():
+                            metrics_data.append({
+                                'Cluster': f'Cluster {cluster_id}',
+                                'Size': metrics['size'],
+                                'Avg Salary': f"₹{metrics['avg_salary']:,.2f}",
+                                'Avg Experience': f"{metrics['avg_experience']:.1f} years",
+                                'Most Common Role': metrics['common_role'],
+                                'Top Skills': ', '.join(metrics['common_skills'].keys())
+                            })
+                        
+                        st.dataframe(
+                            pd.DataFrame(metrics_data).set_index('Cluster'),
+                            use_container_width=True
+                        )
+                
+                with tab2:
+                    # Visualization controls
+                    plot_type = st.selectbox(
+                        "Select plot type:",
+                        ["3D Scatter", "2D Scatter", "PCA", "Box Plots"],
+                        index=["3D Scatter", "2D Scatter", "PCA", "Box Plots"].index(
+                            st.session_state.clustering_params.get('plot_type', '3D Scatter'))
+                    )
+                    st.session_state.clustering_params['plot_type'] = plot_type
+                    
+                    # Use default Plotly color scale
+                    color_scale = px.colors.qualitative.Plotly
+                    
+                    # Generate appropriate visualization based on selection
+                    if plot_type == "3D Scatter" and len(selected_features) >= 3:
+                        fig = px.scatter_3d(
+                            df_clustered, 
+                            x=selected_features[0], 
+                            y=selected_features[1], 
+                            z=selected_features[2],
+                            color='Cluster',
+                            title='3D Cluster Visualization',
+                            color_discrete_sequence=color_scale,
+                            hover_data=df_clustered.columns,
+                            opacity=0.7
+                        )
+                        fig.update_layout(
+                            scene=dict(
+                                xaxis_title=selected_features[0],
+                                yaxis_title=selected_features[1],
+                                zaxis_title=selected_features[2]
+                            )
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                    elif plot_type == "2D Scatter" or (plot_type == "3D Scatter" and len(selected_features) < 3):
+                        x_axis = st.selectbox("X-axis:", selected_features, index=0)
+                        y_axis = st.selectbox("Y-axis:", [f for f in selected_features if f != x_axis], 
+                                            index=min(1, len(selected_features)-1))
+                        
+                        fig = px.scatter(
+                            df_clustered, 
+                            x=x_axis, 
+                            y=y_axis,
+                            color='Cluster',
+                            title=f"{x_axis} vs {y_axis} by Cluster",
+                            color_discrete_sequence=color_scale,
+                            hover_data=df_clustered.columns,
+                            opacity=0.7,
+                            size='Distance_to_Center',
+                            size_max=15
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                    elif plot_type == "PCA" and 'PCA1' in df_clustered.columns:
+                        fig = px.scatter(
+                            df_clustered,
+                            x='PCA1',
+                            y='PCA2',
+                            color='Cluster',
+                            title='PCA Visualization of Clusters',
+                            color_discrete_sequence=color_scale,
+                            hover_data=df_clustered.columns,
+                            opacity=0.7
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                    elif plot_type == "t-SNE":
+                        fig = px.scatter(
+                            df_clustered,
+                            x='tSNE1',
+                            y='tSNE2',
+                            color='Cluster',
+                            title='t-SNE Visualization of Clusters',
+                            color_discrete_sequence=color_scale,
+                            hover_data=df_clustered.columns,
+                            opacity=0.7
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                    elif plot_type == "Parallel Coordinates":
+                        fig = px.parallel_coordinates(
+                            df_clustered,
+                            color='Cluster',
+                            dimensions=selected_features[:min(8, len(selected_features))],
+                            color_continuous_scale=color_scale,
+                            title='Parallel Coordinates Plot'
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                    elif plot_type == "Box Plots":
+                        # Create a box plot for each feature by cluster
+                        for feature in selected_features:
+                            fig = px.box(
+                                df_clustered,
+                                x='Cluster',
+                                y=feature,
+                                color='Cluster',
+                                title=f'Distribution of {feature} by Cluster',
+                                color_discrete_sequence=color_scale
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                
+                with tab3:
+                    # Show detailed statistics for each cluster
+                    st.subheader("Detailed Cluster Analysis")
+                    
+                    # Cluster selector
+                    selected_cluster = st.selectbox(
+                        "Select a cluster to analyze:",
+                        options=sorted(df_clustered['Cluster'].unique()),
+                        format_func=lambda x: f"Cluster {x} ({len(df_clustered[df_clustered['Cluster'] == x])} employees)",
+                        key='selected_cluster'
+                    )
+                    
+                    if selected_cluster is not None:
+                        cluster_data = df_clustered[df_clustered['Cluster'] == selected_cluster]
+                        metrics = cluster_metrics[selected_cluster]
+                        
+                        # Store last viewed cluster in session state
+                        st.session_state.clustering_params['last_cluster_id'] = selected_cluster
+                        
+                        # Show cluster summary
+                        st.subheader(f"Cluster {selected_cluster} Summary")
+                        
+                        # Key metrics
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Number of Employees", metrics['size'])
+                        with col2:
+                            st.metric("Average Salary", f"₹{metrics['avg_salary']:,.2f}")
+                        with col3:
+                            st.metric("Average Experience", f"{metrics['avg_experience']:.1f} years")
+                        
+                        # Most common role and skills
+                        col4, col5 = st.columns(2)
+                        with col4:
+                            st.metric("Most Common Role", metrics['common_role'])
+                        with col5:
+                            st.metric("Top Skills", 
+                                    ", ".join(metrics['common_skills'].keys()) if metrics['common_skills'] else "N/A")
+                        
+                        # Feature distributions
+                        st.subheader("Feature Distributions")
+                        for feature in selected_features:
+                            fig = px.histogram(
+                                cluster_data, 
+                                x=feature, 
+                                title=f"{feature} Distribution in Cluster {selected_cluster}",
+                                nbins=20,
+                                color_discrete_sequence=[px.colors.qualitative.Pastel[0]]
+                            )
+                            # Add vertical line for mean
+                            fig.add_vline(
+                                x=cluster_data[feature].mean(), 
+                                line_dash="dash", 
+                                line_color="red",
+                                annotation_text=f"Mean: {cluster_data[feature].mean():.2f}",
+                                annotation_position="top right"
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Sample employees from the cluster
+                        st.subheader("Sample Employees")
+                        st.dataframe(
+                            cluster_data.drop('Cluster', axis=1).head(5).style.background_gradient(
+                                cmap='Blues',
+                                subset=pd.IndexSlice[:, numeric_cols]
+                            ),
+                            use_container_width=True,
+                            height=250
+                        )
+                        
+                        # Download button for this cluster's data
+                        st.download_button(
+                            label=f"📥 Download Cluster {selected_cluster} Data",
+                            data=cluster_data.to_csv(index=False).encode('utf-8'),
+                            file_name=f"cluster_{selected_cluster}_employees.csv",
+                            mime="text/csv",
+                            key=f"download_cluster_{selected_cluster}"
+                        )
+                        
+                # Add salary prediction and role classification section
+                st.markdown("---")
+                st.header("🔮 Cluster Analysis & Predictions")
+                
+                # Show predictions for the selected cluster
+                selected_cluster = st.session_state.clustering_params.get('last_cluster_id')
+                if selected_cluster is None and st.session_state.clustering_params['cluster_metrics']:
+                    selected_cluster = list(st.session_state.clustering_params['cluster_metrics'].keys())[0]
+                
+                if selected_cluster is not None:
+                    cluster_data = df_clustered[df_clustered['Cluster'] == selected_cluster]
+                    
+                    # Create tabs for different prediction types
+                    pred_tab1, pred_tab2 = st.tabs(["Salary Prediction", "Role Classification"])
+                    
+                    with pred_tab1:
+                        st.subheader(f"💵 Salary Prediction for Cluster {selected_cluster}")
+                        
+                        # Show cluster salary statistics
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("Average Salary", f"₹{cluster_data['Salary'].mean():,.2f}")
+                            st.metric("Median Salary", f"₹{cluster_data['Salary'].median():,.2f}")
+                        with col2:
+                            st.metric("Salary Range", 
+                                    f"₹{cluster_data['Salary'].min():,.0f} - ₹{cluster_data['Salary'].max():,.0f}")
+                            st.metric("Standard Deviation", f"₹{cluster_data['Salary'].std():,.2f}")
+                        
+                        # Predict salary for cluster
+                        if st.button(f"🔮 Predict Salary for Cluster {selected_cluster}", 
+                                   use_container_width=True,
+                                   key=f"predict_cluster_{selected_cluster}"):
+                            try:
+                                # Use median/mode values for prediction
+                                input_data = {
+                                    'Age': cluster_data['Age'].median(),
+                                    'Gender': cluster_data['Gender'].mode()[0],
+                                    'Department': cluster_data['Department'].mode()[0],
+                                    'ExperienceYears': cluster_data['ExperienceYears'].median(),
+                                    'EducationLevel': cluster_data['EducationLevel'].mode()[0],
+                                    'PerformanceRating': cluster_data['PerformanceRating'].median(),
+                                    'LastPromotionYear': cluster_data['LastPromotionYear'].median(),
+                                    'ProductivityScore': cluster_data['ProductivityScore'].median(),
+                                    'Skillset': cluster_data['Skillset'].mode()[0] if 'Skillset' in cluster_data.columns else ''
+                                }
+                                
+                                predicted_salary = predict_salary(input_data)
+                                if predicted_salary is not None:
+                                    st.success(f"✅ Predicted Salary: ₹{predicted_salary:,.2f}")
+                                    
+                                    # Show comparison with cluster average
+                                    avg_salary = cluster_data['Salary'].mean()
+                                    diff = predicted_salary - avg_salary
+                                    diff_pct = (diff / avg_salary) * 100
+                                    
+                                    st.metric(
+                                        "Comparison with Cluster Average",
+                                        f"₹{abs(diff):,.2f} ({abs(diff_pct):.1f}% {'higher' if diff > 0 else 'lower'})",
+                                        delta=f"{diff_pct:+.1f}% vs cluster average",
+                                        delta_color="normal" if diff >= 0 else "inverse"
+                                    )
+                                    
+                                    # Show AI suggestion
+                                    with st.expander("💡 AI-Powered Insights"):
+                                        ai_suggestion = get_ai_salary_suggestion(
+                                            input_data, 
+                                            predicted_salary, 
+                                            df_clustered
+                                        )
+                                        st.markdown(ai_suggestion)
+                                        
+                            except Exception as e:
+                                st.error(f"Error predicting salary: {str(e)}")
+                    
+                    with pred_tab2:
+                        st.subheader(f"👔 Role Classification for Cluster {selected_cluster}")
+                        
+                        if 'Designation' in cluster_data.columns:
+                            # Show role distribution
+                            role_dist = cluster_data['Designation'].value_counts().reset_index()
+                            role_dist.columns = ['Role', 'Count']
+                            role_dist['Percentage'] = (role_dist['Count'] / len(cluster_data)) * 100
+                            
+                            col1, col2 = st.columns([1, 2])
+                            with col1:
+                                st.metric("Unique Roles", role_dist['Role'].nunique())
+                                st.metric("Most Common Role", 
+                                         f"{role_dist.iloc[0]['Role']} ({role_dist.iloc[0]['Percentage']:.1f}%)")
+                            
+                            with col2:
+                                fig_roles = px.pie(
+                                    role_dist.head(5), 
+                                    values='Count', 
+                                    names='Role',
+                                    title=f'Top 5 Roles in Cluster {selected_cluster}',
+                                    hole=0.5,
+                                    color_discrete_sequence=px.colors.qualitative.Pastel
+                                )
+                                st.plotly_chart(fig_roles, use_container_width=True)
+                            
+                            # Classify role based on cluster averages
+                            if st.button(f"🔍 Classify Role for Cluster {selected_cluster}", 
+                                       use_container_width=True,
+                                       key=f"classify_cluster_{selected_cluster}"):
+                                try:
+                                    input_data = {
+                                        'Salary': cluster_data['Salary'].median(),
+                                        'ExperienceYears': cluster_data['ExperienceYears'].median(),
+                                        'ProductivityScore': cluster_data['ProductivityScore'].median(),
+                                        'Skillset': cluster_data['Skillset'].mode()[0] if 'Skillset' in cluster_data.columns else ''
+                                    }
+                                    
+                                    predicted_role = classify_role(input_data)
+                                    if predicted_role is not None:
+                                        st.success(f"✅ Recommended Role: {predicted_role}")
+                                        
+                                        # Compare with most common role in cluster
+                                        common_role = cluster_data['Designation'].mode()[0]
+                                        if predicted_role == common_role:
+                                            st.info(f"This matches the most common role in this cluster.")
+                                        else:
+                                            st.info(f"Most common role in this cluster is: {common_role}")
+                                        
+                                        # Show AI suggestion
+                                        with st.expander("💡 AI-Powered Career Insights"):
+                                            ai_suggestion = get_ai_role_suggestion(
+                                                input_data, 
+                                                predicted_role, 
+                                                df_clustered
+                                            )
+                                            st.markdown(ai_suggestion)
+                                            
+                                except Exception as e:
+                                    st.error(f"Error classifying role: {str(e)}")
+                        else:
+                            st.warning("Designation column not found in the dataset. Cannot perform role classification.")
+                
+                # Global download button for all clusters
+                st.download_button(
+                    label="📥 Download All Clustered Data",
+                    data=df_clustered.to_csv(index=False).encode('utf-8'),
+                    file_name=f"all_clusters_k{n_clusters}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="download_all_clusters"
+                )
+                
+                # Add salary prediction section
+                st.markdown("---")
+                st.header("💰 Salary Prediction for Clustered Employees")
+                
+                # Show predictions for the selected cluster
+                selected_cluster = st.session_state.clustering_params.get('last_cluster_id')
+                if selected_cluster is None and st.session_state.clustering_params['cluster_metrics']:
+                    selected_cluster = list(st.session_state.clustering_params['cluster_metrics'].keys())[0]
+                
+                if selected_cluster is not None:
+                    cluster_data = df_clustered[df_clustered['Cluster'] == selected_cluster].copy()
+                    
+                    # Display cluster statistics
+                    if not cluster_data.empty:
+                        avg_salary = cluster_data['Salary'].mean()
+                        avg_experience = cluster_data['ExperienceYears'].mean()
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("Average Salary", f"₹{avg_salary:,.2f}")
+                            st.metric("Median Salary", f"₹{cluster_data['Salary'].median():,.2f}")
+                        with col2:
+                            st.metric("Salary Range", 
+                                    f"₹{cluster_data['Salary'].min():,.0f} - ₹{cluster_data['Salary'].max():,.0f}")
+                            st.metric("Standard Deviation", f"₹{cluster_data['Salary'].std():,.2f}")
+                        
+                        # Add predict salary button with unique key
+                        if st.button(f"🔮 Predict Salary for Cluster {selected_cluster}", 
+                                   use_container_width=True,
+                                   key=f"predict_salary_cluster_{selected_cluster}"):
+                            try:
+                                # Use median/mode values for prediction
+                                input_data = {
+                                    'Age': cluster_data['Age'].median(),
+                                    'Gender': cluster_data['Gender'].mode()[0],
+                                    'Department': cluster_data['Department'].mode()[0],
+                                    'ExperienceYears': cluster_data['ExperienceYears'].median(),
+                                    'EducationLevel': cluster_data['EducationLevel'].mode()[0],
+                                    'PerformanceRating': cluster_data['PerformanceRating'].median(),
+                                    'LastPromotionYear': cluster_data['LastPromotionYear'].median(),
+                                    'ProductivityScore': cluster_data['ProductivityScore'].median(),
+                                    'Skillset': cluster_data['Skillset'].mode()[0] if 'Skillset' in cluster_data.columns else ''
+                                }
+                                
+                                predicted_salary = predict_salary(input_data)
+                                if predicted_salary is not None:
+                                    st.success(f"✅ Predicted Salary: ₹{predicted_salary:,.2f}")
+                                    
+                                    # Show comparison with cluster average
+                                    diff = predicted_salary - avg_salary
+                                    if diff > 0:
+                                        st.info(f"This is ₹{diff:,.2f} higher than the cluster average.")
+                                    elif diff < 0:
+                                        st.warning(f"This is ₹{abs(diff):,.2f} lower than the cluster average.")
+                                    else:
+                                        st.info("This matches the cluster average.")
+                                    
+                                    # Show AI suggestion
+                                    with st.expander("💡 AI-Powered Insights"):
+                                        ai_suggestion = get_ai_salary_suggestion(
+                                            input_data, 
+                                            predicted_salary, 
+                                            df_clustered
+                                        )
+                                        st.markdown(ai_suggestion)
+                                        
+                            except Exception as e:
+                                st.error(f"Error predicting salary: {str(e)}")
+                            
+                            # Add role classification section
+                            st.markdown("---")
+                            st.header("👔 Role Classification for Clustered Employees")
+                            
+                            if not cluster_data.empty and 'Designation' in cluster_data.columns:
+                                # Show most common role in cluster
+                                common_role = cluster_data['Designation'].mode()[0]
+                                role_count = len(cluster_data[cluster_data['Designation'] == common_role])
+                                role_percentage = (role_count / len(cluster_data)) * 100
+                                
+                                st.metric("Most Common Role", f"{common_role} ({role_percentage:.1f}% of cluster)")
+                                
+                                # Classify role based on cluster averages with unique key
+                                if st.button(f"Classify Role for Cluster {selected_cluster}",
+                                           key=f"classify_role_{selected_cluster}"):
+                                    try:
+                                        input_data = {
+                                            'Salary': cluster_data['Salary'].median(),
+                                            'ExperienceYears': cluster_data['ExperienceYears'].median(),
+                                            'ProductivityScore': cluster_data['ProductivityScore'].median(),
+                                            'Skillset': cluster_data['Skillset'].mode()[0] if 'Skillset' in cluster_data.columns else ''
+                                        }
+                                        
+                                        predicted_role = classify_role(input_data)
+                                        if predicted_role:
+                                            st.success(f"✅ Recommended Role: {predicted_role}")
+                                            
+                                            # Compare with most common role in cluster
+                                            if predicted_role == common_role:
+                                                st.info("This matches the most common role in this cluster.")
+                                            else:
+                                                st.info(f"Most common role in cluster is {common_role}.")
+                                                
+                                    except Exception as e:
+                                        st.error(f"Error classifying role: {str(e)}")
+    
+    st.markdown("---")
+    st.markdown("Built with ❤ using Streamlit")
+
+if __name__ == "__main__":
+    main()
